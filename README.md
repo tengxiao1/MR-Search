@@ -1,4 +1,4 @@
-# Meta-Reinforcement Learning with Self-Reflection
+## Meta-Reinforcement Learning with Self-Reflection for Agentic Search
 
 <p align="center">
   <a href="https://arxiv.org/abs/2603.11327"><img src="https://img.shields.io/badge/arXiv-2603.11327-b31b1b.svg" alt="arXiv"></a>
