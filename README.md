@@ -6,7 +6,7 @@
 
 ## Introduction
 
-Existing RL-based agentic search methods optimize within a single episode, treating each attempt in isolation. We introduce **MR-Search**, a **Meta-Reinforcement Learning** framework that trains agents to improve **across episodes** via explicit self-reflection. As shown below, MR-Search organizes training into *meta-episodes* of multiple *inner-episodes*. After each failed attempt, the agent generates a natural-language **Self-Reflection** that is prepended to the next episode, enabling progressive strategy refinement.
+Existing RL-based agentic search methods optimize within a single episode, treating each attempt in isolation. We introduce **MR-Search**, a **Meta-Reinforcement Learning** framework that trains agents to improve **across episodes** via explicit self-reflection. As shown below, MR-Search organizes training into *meta-episodes* of multiple *inner-episodes*. After each failed attempt, the agent generates **Self-Reflection** that is prepended to the next episode, enabling progressive strategy refinement.
 
 <p align="center">
   <img src="assets/MetaSearch-1.png" alt="MR-Search Framework" width="90%">
