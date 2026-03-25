@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  🧠 In-Context Meta-Reinforcement Learning &nbsp;|&nbsp; 🪞 Self-Reflection &nbsp;|&nbsp; 🔁 Learning to learn at test time
+  🧠 In-Context Meta-Reinforcement Learning &nbsp;|&nbsp; 🪞 Self-Reflection &nbsp;|&nbsp; 🔁 Learning How to search at Test Time
 </p>
 
 ## Introduction
