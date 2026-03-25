@@ -1,0 +1,1802 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2022 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Core functions to implement PPO algorithms.
+The function implemented in this file should be used by trainer with different distributed strategies to
+implement PPO-like algorithms.
+"""
+
+__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+
+from collections import defaultdict
+from enum import Enum
+from typing import Optional
+
+import numpy as np
+import torch
+
+import verl.utils.torch_functional as verl_F
+from verl.trainer.config import AlgoConfig
+from typing import Optional, Tuple, Dict
+
+POLICY_LOSS_REGISTRY = {}
+
+
+def register_policy_loss(name):
+    """Register a policy loss function with the given name.
+
+    Args:
+        name (str): The name to register the policy loss function under.
+
+    Returns:
+        function: Decorator function that registers the policy loss function.
+    """
+
+    def decorator(func):
+        POLICY_LOSS_REGISTRY[name] = func
+        return func
+
+    return decorator
+
+
+def get_policy_loss_fn(name):
+    """Get the policy loss with a given name.
+
+    Args:
+        name: `(str)`
+            The name of the policy loss.
+
+    Returns:
+        `(callable)`: The policy loss function.
+    """
+    loss_name = name
+    if loss_name not in POLICY_LOSS_REGISTRY:
+        raise ValueError(
+            f"Unsupported loss mode: {loss_name}. Supported modes are: {list(POLICY_LOSS_REGISTRY.keys())}"
+        )
+    return POLICY_LOSS_REGISTRY[loss_name]
+
+
+ADV_ESTIMATOR_REGISTRY = {}
+
+
+def register_adv_est(name_or_enum):
+    """Decorator to register a advantage estimator function with a given name.
+
+    Args:
+        name_or_enum: `(str)` or `(AdvantageEstimator)`
+            The name or enum of the advantage estimator.
+
+    """
+
+    def decorator(fn):
+        name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+        if name in ADV_ESTIMATOR_REGISTRY and ADV_ESTIMATOR_REGISTRY[name] != fn:
+            raise ValueError(
+                f"Adv estimator {name} has already been registered: {ADV_ESTIMATOR_REGISTRY[name]} vs {fn}"
+            )
+        ADV_ESTIMATOR_REGISTRY[name] = fn
+        return fn
+
+    return decorator
+
+
+def get_adv_estimator_fn(name_or_enum):
+    """Get the advantage estimator function with a given name.
+
+    Args:
+        name_or_enum: `(str)` or `(AdvantageEstimator)`
+            The name or enum of the advantage estimator.
+
+    Returns:
+        `(callable)`: The advantage estimator function.
+    """
+    name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+    if name not in ADV_ESTIMATOR_REGISTRY:
+        raise ValueError(f"Unknown advantage estimator simply: {name}")
+    return ADV_ESTIMATOR_REGISTRY[name]
+
+
+class AdvantageEstimator(str, Enum):
+    """Using an enumeration class to avoid spelling errors in adv_estimator.
+
+    Note(haibin.lin): this enum class is immutable after creation. Extending this
+    enum for new estimators may not be necessary since users can always just call
+    `verl.trainer.ppo.core_algos.register` with string name for a custom advantage
+    estimator instead.
+    """
+
+    GAE = "gae"
+    GRPO = "grpo"
+    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
+    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
+    REMAX = "remax"
+    RLOO = "rloo"
+    OPO = "opo"
+    GRPO_PASSK = "grpo_passk"
+    GPG = "gpg"
+    REINFORCE = 'reinforce'
+    REINFORCE_STEP = 'reinforce_step'
+    GRPO_PRM_STEP = "grpo_prm_step"
+    GRPO_PRM_MIX = "grpo_prm_mix"
+
+
+class AdaptiveKLController:
+    """
+    Adaptive KL controller described in the paper:
+    https://arxiv.org/pdf/1909.08593.pdf
+    """
+
+    def __init__(self, init_kl_coef, target_kl, horizon):
+        self.value = init_kl_coef
+        self.target = target_kl
+        self.horizon = horizon
+
+    def update(self, current_kl, n_steps):
+        """Update the KL coefficient based on current KL divergence.
+
+        Args:
+            current_kl (float): Current KL divergence value.
+            n_steps (int): Number of steps taken.
+        """
+        target = self.target
+        proportional_error = np.clip(current_kl / target - 1, -0.2, 0.2)
+        mult = 1 + proportional_error * n_steps / self.horizon
+        self.value *= mult
+
+
+class FixedKLController:
+    """Fixed KL controller."""
+
+    def __init__(self, kl_coef):
+        self.value = kl_coef
+
+    def update(self, current_kl, n_steps):
+        """Update method for fixed KL controller (no-op).
+
+        Args:
+            current_kl (float): Current KL divergence value (unused).
+            n_steps (int): Number of steps taken (unused).
+        """
+        pass
+
+
+def get_kl_controller(kl_ctrl):
+    """Factory function to create appropriate KL controller based on configuration.
+
+    Args:
+        kl_ctrl: Configuration object containing KL controller settings.
+
+    Returns:
+        KL controller instance (FixedKLController or AdaptiveKLController).
+
+    Raises:
+        NotImplementedError: If controller type is not supported.
+        AssertionError: If adaptive controller horizon is not positive.
+    """
+    if kl_ctrl.type == "fixed":
+        return FixedKLController(kl_coef=kl_ctrl.kl_coef)
+    elif kl_ctrl.type == "adaptive":
+        assert kl_ctrl.horizon > 0, f"horizon must be larger than 0. Got {kl_ctrl.horizon}"
+        return AdaptiveKLController(init_kl_coef=kl_ctrl.kl_coef, target_kl=kl_ctrl.target_kl, horizon=kl_ctrl.horizon)
+    else:
+        raise NotImplementedError
+
+
+@register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
+def compute_gae_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    gamma: torch.Tensor,
+    lam: torch.Tensor,
+):
+    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        values: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length). [EOS] mask. The token after [EOS] have mask zero.
+        gamma is `(float)`
+            discounted factor used in RL
+        lam: `(float)`
+            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+
+    """
+    with torch.no_grad():
+        nextvalues = 0
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_len = token_level_rewards.shape[-1]
+
+        for t in reversed(range(gen_len)):
+            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+            lastgaelam_ = delta + gamma * lam * lastgaelam
+
+            # skip values and TD-error on observation tokens
+            nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+            lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+
+            advantages_reversed.append(lastgaelam)
+        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+
+        returns = advantages + values
+        advantages = verl_F.masked_whiten(advantages, response_mask)
+    return advantages, returns
+
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+@register_adv_est(AdvantageEstimator.GRPO_PRM_MIX)  # or simply: @register_adv_est("grpo")
+def compute_grpo_prm_mix_advantage(
+    token_level_rewards: torch.Tensor,   # (B, T)
+    response_mask: torch.Tensor,         # (B, T)
+    index: np.ndarray,                   # (B,) —— 字符串/UUID 数组
+    step_ids: torch.Tensor,              # (B, T), 0..S-1；pad == -1
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional["AlgoConfig"] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    GRPO: ORM(最后一个 step) + PRM(其余 step)
+
+    改动点（按你的要求）：
+    - PRM 的归一化不再按“同组 + 同 step-id”，而是按“同组内所有 PRM step”统一做一次
+      (x - mean_all_prm) / std_all_prm；然后把每个 PRM step 的 advantage 仅广播到该 step 的 token 上。
+
+    - ORM 保持：末步 step-reward 在同组内做 z-score，广播到整条轨迹。
+
+    返回:
+        advantages: (B, T)
+        returns:    (B, T)  # 与 advantages 一致
+    """
+    print("use grpo prm mix!!")
+
+    assert token_level_rewards.shape[0] == response_mask.shape[0] == step_ids.shape[0], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+    assert token_level_rewards.shape[1] == response_mask.shape[1]+1 == step_ids.shape[1], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+
+    B, T = response_mask.shape
+    device = token_level_rewards.device
+    dtype = token_level_rewards.dtype
+
+    # ---- 构建基于“字符串 index”的分组：group -> 样本下标(np.ndarray[int])
+    if isinstance(index, np.ndarray):
+        idx_list = index.tolist()
+    else:  # 兼容 list/tuple
+        idx_list = list(index)
+    if len(idx_list) != B:
+        raise ValueError(f"index 长度({len(idx_list)})与 batch 大小({B})不一致。")
+
+    group2rows: Dict[str, np.ndarray] = {}
+    for i, k in enumerate(idx_list):
+        group2rows.setdefault(str(k), []).append(i)
+    for k in list(group2rows.keys()):
+        group2rows[k] = np.asarray(group2rows[k], dtype=np.int64)
+
+    valid_tok_mask = step_ids.ge(0)  # (B, T)
+    last_step_per_sample = step_ids.max(dim=1).values  # (B,)
+
+    # print('token_level_rewards',token_level_rewards.tolist()[:2])
+
+    print('alpha', alpha)
+    print('beta', beta)
+    
+    if alpha!=0:
+        # ================= ORM =================
+        mask_orm_tok = ~valid_tok_mask # & (step_ids == last_step_per_sample.unsqueeze(1))
+        orm_reward_per_sample = (token_level_rewards * mask_orm_tok.to(dtype)).sum(dim=1)  # (B,)
+        # print('orm_reward_per_sample', orm_reward_per_sample[:2])
+        orm_present = last_step_per_sample.ge(0)
+        orm_adv_per_sample = groupwise_center_and_scale(orm_reward_per_sample, orm_present, group2rows=group2rows)  # (B,)
+        orm_adv_tokens = orm_adv_per_sample.unsqueeze(1).expand(B, T)  # 广播到整条轨迹
+        
+
+    if beta != 0:
+        step_ids = step_ids[:,:-1]
+        valid_tok_mask = valid_tok_mask[:,:-1]
+        token_level_rewards = token_level_rewards[:,:-1]
+        assert step_ids.shape == response_mask.shape == valid_tok_mask.shape == token_level_rewards.shape
+        # ---------- PRM：所有非最后一步的 step 共用同一组的 mean/std ----------
+        prm_adv_tokens = torch.zeros((B, T), device=device, dtype=dtype)
+
+        # 为了遍历与广播方便，预先计算每个 step-id 的 token mask 与 step-reward
+        max_step_any = int(last_step_per_sample.max().item()) if int(last_step_per_sample.max().item()) >= 0 else -1
+        step_tok_masks = []
+        step_rewards = []  # 列表长度 Smax+1, 每个元素形状 (B,)
+        for s in range(max_step_any + 1):
+            m = valid_tok_mask & (step_ids == s)                   # (B, T)
+            step_tok_masks.append(m)
+            step_rewards.append((token_level_rewards * m.to(dtype)).sum(dim=1))  # (B,)
+
+        for g, rows_np in group2rows.items():
+            rows = torch.as_tensor(rows_np, device=device, dtype=torch.long)
+
+            # 找出该组内所有 PRM step 的 step-reward，打平成一个一维向量用于统计
+            prm_values_list = []
+            # 同时记录每个 (s, rows_present) 以便之后回写
+            step_rows_present = []  # [(s, rows_present_tensor), ...]
+
+            for s in range(max_step_any + 1):
+                # 该组内、存在 step s 且 s 不是末步 的样本
+                has_s     = last_step_per_sample[rows].ge(s)
+                # is_last_s = last_step_per_sample[rows].eq(s)
+                present   = has_s #& (~is_last_s)
+                if not bool(present.any()):
+                    continue
+                rows_present = rows[present]
+                v_s = step_rewards[s][rows_present]  # (num_present,)
+                # 只要该样本确实有该 step 的 token（通常成立；为稳妥再过滤一次）
+                has_tok = step_tok_masks[s][rows_present].any(dim=1)  # (num_present,)
+                if not bool(has_tok.any()):
+                    continue
+                rows_present = rows_present[has_tok]
+                v_s = v_s[has_tok]
+
+                prm_values_list.append(v_s)
+                step_rows_present.append((s, rows_present))
+
+            if len(prm_values_list) == 0:
+                # 该组没有任何 PRM step（例如每条样本只有 1 个 step）
+                continue
+
+            all_prm_vals = torch.cat(prm_values_list, dim=0)  # 组内全部 PRM step 的 rewards
+            cnt = all_prm_vals.numel()
+            if cnt == 1:
+                prm_mean = all_prm_vals.new_zeros(())
+                prm_std  = all_prm_vals.new_ones(())
+            else:
+                prm_mean = all_prm_vals.mean()
+                prm_std  = all_prm_vals.std()
+
+            # 把统一的 (mean,std) 应用到每个 PRM step，并仅广播到该 step 的 token 上
+            for s, rows_present in step_rows_present:
+                v_s = step_rewards[s][rows_present]
+                if norm_adv_by_std_in_grpo:
+                    adv_s = (v_s - prm_mean) / (prm_std + epsilon)
+                else:
+                    adv_s = (v_s - prm_mean)
+
+                m_tok = step_tok_masks[s][rows_present]  # (num_present, T)
+                prm_adv_tokens[rows_present] += adv_s.unsqueeze(1) * m_tok.to(dtype)
+
+    # ================= 汇总 =================
+    if (alpha != 0) and (beta != 0):
+        print('prm + orm')
+        advantages = (alpha * orm_adv_tokens + beta * prm_adv_tokens) * response_mask.to(dtype)
+    elif (alpha != 0) and (beta == 0):
+        print('orm only')
+        advantages = orm_adv_tokens * response_mask.to(dtype)
+    elif (alpha == 0) and (beta != 0):
+        print('prm only')
+        advantages = prm_adv_tokens * response_mask.to(dtype)
+    else:
+        raise
+
+    returns = advantages.clone()
+    return advantages, returns
+
+
+def compute_mean(text, nums):
+        arr = np.array(nums.detach().tolist())
+
+        pos_mask = arr > 0
+        neg_mask = arr < 0
+
+        pos_mean = arr[pos_mask].mean() if pos_mask.any() else np.nan
+        neg_mean = arr[neg_mask].mean() if neg_mask.any() else np.nan
+        mean_abs = np.abs(arr).mean()
+
+        print(f"【{text}】: 大于0的均值: {pos_mean:.10f} ; 小于0的均值: {neg_mean:.10f} ; 绝对值的均值: {mean_abs:.10f}")
+
+
+def groupwise_center_and_scale(values: torch.Tensor,
+                                present_mask: torch.Tensor,
+                                group2rows: Dict[str, np.ndarray],
+                                norm_adv_by_std_in_grpo: bool = True,
+                                epsilon: float = 1e-6) -> torch.Tensor:
+    """
+    values: (B,) 每个样本一个标量
+    present_mask: (B,) 仅参与本轮统计/赋值的样本
+    返回: (B,) 仅对 present==1 的位置写入，其他为 0
+    """
+    out = torch.zeros_like(values)
+    for g, rows_np in group2rows.items():
+        rows = torch.as_tensor(rows_np, device=values.device, dtype=torch.long)  # 这些是样本下标
+        pm = present_mask[rows]
+        if not bool(pm.any()):
+            continue
+        v = values[rows][pm]
+        cnt = v.numel()
+        if cnt == 1:
+            mean_g = v.new_zeros(())
+            std_g = v.new_ones(())
+        else:
+            mean_g = v.mean()
+            std_g = v.std()
+        if norm_adv_by_std_in_grpo:
+            out_vals = (values[rows][pm] - mean_g) / (std_g + epsilon)
+        else:
+            out_vals = values[rows][pm] - mean_g
+        out[rows[pm]] = out_vals
+    return out
+
+
+def groupwise_center_and_scale_loo(
+    values: torch.Tensor,
+    present_mask: torch.Tensor,
+    group2rows: Dict[str, np.ndarray],
+    norm_adv_by_std_in_grpo: bool = False,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """
+    values: (B,) 每个样本一个标量
+    present_mask: (B,) 仅参与本轮统计/赋值的样本
+    返回: (B,) 仅对 present==1 的位置写入，其他为 0
+
+    LOO: 对 group 内每个样本 i
+      mean_loo(i) = mean({x_j | j!=i, present})
+      std_loo(i)  = std ({x_j | j!=i, present})
+    """
+    out = torch.zeros_like(values)
+
+    for g, rows_np in group2rows.items():
+        rows = torch.as_tensor(rows_np, device=values.device, dtype=torch.long)
+        print('rows',rows)
+        pm = present_mask[rows].to(torch.bool)
+        if not bool(pm.any()):
+            continue
+
+        idx = rows[pm]           # 本组内 present 的全局下标
+        print('idx',idx)
+        x = values[idx]          # (n,)
+        print('x',x)
+        n = x.numel()
+        print('n',n)
+        if n == 1:
+            # 只有一个样本：按你原来逻辑，输出 0（mean=0, std=1）
+            out[idx] = x.new_zeros((1,))
+            continue
+
+        # 组内统计量（仅 present）
+        s = x.sum()
+        print('sssss',s)
+        ss = (x * x).sum()
+
+        m = n - 1  # LOO 子集大小
+
+        # 对每个元素 i：sum_loo = s - x_i, sumsq_loo = ss - x_i^2
+        sum_loo = s - x
+        print('sum_loo',sum_loo)
+        sumsq_loo = ss - x * x
+        mean_loo = sum_loo / m   # (n,)
+        print('mean_loo',mean_loo)
+
+        norm_adv_by_std_in_grpo = False
+        if norm_adv_by_std_in_grpo:
+            if m <= 1:
+                # n==2 时，LOO 子集只有 1 个点，方差没法估；设 std=1
+                std_loo = x.new_ones((n,))
+            else:
+                # unbiased 方差：Var = [Σ (y-mean)^2] / (m-1)
+                # 其中 Σ (y-mean)^2 = sumsq_loo - m * mean_loo^2
+                sse = sumsq_loo - m * (mean_loo * mean_loo)
+                var_loo = sse / (m - 1)
+                std_loo = torch.sqrt(torch.clamp(var_loo, min=0.0))
+
+            out[idx] = (x - mean_loo) / (std_loo + epsilon)
+        else:
+            out[idx] = x - mean_loo
+            print('out',out[idx])
+
+    return out
+
+
+# def groupwise_center_and_scale_loo(values: torch.Tensor,
+#                                 present_mask: torch.Tensor,
+#                                 group2rows: Dict[str, np.ndarray],
+#                                 norm_adv_by_std_in_grpo: bool = True,
+#                                 epsilon: float = 1e-6) -> torch.Tensor:
+#     """
+#     values: (B,) 每个样本一个标量
+#     present_mask: (B,) 仅参与本轮统计/赋值的样本
+#     返回: (B,) 仅对 present==1 的位置写入，其他为 0
+#     """
+#     out = torch.zeros_like(values)
+#     for g, rows_np in group2rows.items():
+#         rows = torch.as_tensor(rows_np, device=values.device, dtype=torch.long)  # 这些是样本下标
+#         pm = present_mask[rows]
+#         if not bool(pm.any()):
+#             continue
+#         v = values[rows][pm]
+#         cnt = v.numel()
+#         if cnt == 1:
+#             mean_g = v.new_zeros(())
+#             std_g = v.new_ones(())
+#         else:
+#             mean_g = v.mean()
+#             std_g = v.std()
+#         if norm_adv_by_std_in_grpo:
+#             out_vals = (values[rows][pm] - mean_g) / (std_g + epsilon)
+#         else:
+#             out_vals = values[rows][pm] - mean_g
+#         out[rows[pm]] = out_vals
+#     return out
+    
+
+@register_adv_est(AdvantageEstimator.GRPO_PRM_STEP) 
+def compute_grpo_prm_step_advantage(
+    token_level_rewards: torch.Tensor,   # (B, T)
+    response_mask: torch.Tensor,         # (B, T)
+    index: np.ndarray,                   # (B,) —— 字符串/UUID 数组
+    step_ids: torch.Tensor,              # (B, T), 0..S-1；pad == -1
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    discount: float = 1.0,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional["AlgoConfig"] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    GRPO: ORM(最后一个 step) + PRM(其余 step)
+    - 组内定义按字符串 index 判定：相同字符串 => 同一组
+    - ORM：末步 step-reward 在同组内做 (x-mean)/std，广播到整条轨迹
+    - PRM：每个非末步 step 的 step-reward 在“同组 + 同 step 序号”内做 (x-mean)/std，
+           广播到该 step 的所有 token
+    - 最终 advantage 为两者逐 token 相加，并乘 response_mask
+    """
+    print("use grpo prm step!!")
+
+    assert token_level_rewards.shape[0] == response_mask.shape[0] == step_ids.shape[0], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+    assert token_level_rewards.shape[1] == response_mask.shape[1]+1 == step_ids.shape[1], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+
+    B, T = response_mask.shape
+    device = token_level_rewards.device
+    dtype = token_level_rewards.dtype
+
+    if isinstance(index, np.ndarray):
+        idx_list = index.tolist()
+    else:
+        idx_list = list(index)
+    if len(idx_list) != B:
+        raise ValueError(f"index 长度({len(idx_list)})与 batch 大小({B})不一致。")
+
+    group2rows: Dict[str, np.ndarray] = {}
+    for i, k in enumerate(idx_list):
+        group2rows.setdefault(str(k), []).append(i)
+    for k in list(group2rows.keys()):
+        group2rows[k] = np.asarray(group2rows[k], dtype=np.int64)
+
+    valid_tok_mask = step_ids.ge(0)  # (B, T)
+    last_step_per_sample = step_ids.max(dim=1).values  # (B,)
+
+    print('alpha', alpha)
+    print('beta', beta)
+    
+    if alpha!=0:
+        # ================= ORM =================
+        mask_orm_tok = ~valid_tok_mask # & (step_ids == last_step_per_sample.unsqueeze(1))
+        orm_reward_per_sample = (token_level_rewards * mask_orm_tok.to(dtype)).sum(dim=1)  # (B,)
+        print('orm_reward_per_sample', orm_reward_per_sample[:2])
+        orm_present = last_step_per_sample.ge(0)
+        #orm_adv_per_sample = groupwise_center_and_scale(orm_reward_per_sample, orm_present, group2rows=group2rows)  # (B,)
+        orm_adv_per_sample = groupwise_center_and_scale_loo(orm_reward_per_sample, orm_present, group2rows=group2rows)  # (B,)
+        # compute_mean('ORM', orm_adv_per_sample)
+        #print('orm_adv_per_sample', orm_adv_per_sample.detach().tolist())
+        orm_adv_tokens = orm_adv_per_sample.unsqueeze(1).expand(B, T)  # 广播到整条轨迹
+        # advantages = orm_adv_tokens * response_mask.to(dtype)
+    
+    if beta != 0:
+        # ================= PRM =================
+        step_ids = step_ids[:,:-1]
+        valid_tok_mask = valid_tok_mask[:,:-1]
+        token_level_rewards = token_level_rewards[:,:-1]
+        assert step_ids.shape == response_mask.shape == valid_tok_mask.shape == token_level_rewards.shape
+        # ================= PRM =================
+        prm_adv_tokens = torch.zeros((B, T), device=device, dtype=dtype)
+        max_step_any = int(last_step_per_sample.max().item()) if int(last_step_per_sample.max().item()) >= 0 else -1
+
+        for s in range(max_step_any + 1):
+            has_step_s = last_step_per_sample.ge(s)
+            # is_last_step = last_step_per_sample.eq(s)
+            prm_present = has_step_s #& (~is_last_step)  # 仅非末步参与 PRM
+
+            if not bool(prm_present.any()):
+                continue
+
+            mask_s_tok = valid_tok_mask & (step_ids == s)               # (B, T)
+            if not bool(mask_s_tok.any()):
+                continue
+
+            step_reward_s = (token_level_rewards * mask_s_tok.to(dtype)).sum(dim=1)  # (B,)
+            print('step_reward_s', s, step_reward_s[:2])
+            #step_adv_per_sample = groupwise_center_and_scale(step_reward_s, prm_present, group2rows=group2rows)  # (B,)
+            step_adv_per_sample = groupwise_center_and_scale_loo(step_reward_s, prm_present, group2rows=group2rows)  # (B,)
+            # compute_mean('PRM', step_adv_per_sample)
+            prm_adv_tokens = prm_adv_tokens + step_adv_per_sample.unsqueeze(1) * mask_s_tok.to(dtype)
+
+        # ================= Step-level discounted cumulative (append-only) =================
+        # 折扣因子 gamma：建议放到 config 里，例如 config.adv_gamma
+        # discount = 1.0
+        print('discount!!!',discount)
+
+        # step_ids 可能是 (B, T+1) 或已经在 beta 分支里切成 (B, T)
+        if step_ids.shape[1] == T + 1:
+            sids = step_ids[:, :-1]        # (B, T)
+        else:
+            sids = step_ids                # (B, T)
+
+        valid = (sids.ge(0)) & (response_mask.bool())      # (B, T)
+        last_step = sids.masked_fill(~valid, -1).max(dim=1).values  # (B,)
+
+        Smax = int(sids.max().item()) if int(sids.max().item()) >= 0 else -1
+        if Smax >= 0:
+            # 1) 先把 token-level advantages 聚合成 step-level A_step: (B, Smax+1)
+            A_step = torch.zeros((B, Smax + 1), device=device, dtype=dtype)
+
+            for s in range(Smax + 1):
+                mask_s = valid & (sids == s)                       # (B, T)
+                cnt = mask_s.sum(dim=1)                            # (B,)
+                if not bool((cnt > 0).any()):
+                    continue
+                # step 内 token advantage 理论上应相同；这里用 mean 更稳健
+                step_val = (prm_adv_tokens * mask_s.to(dtype)).sum(dim=1) / cnt.clamp_min(1).to(dtype)  # (B,)
+                A_step[:, s] = step_val * (cnt > 0).to(dtype)
+
+            # 2) 做 step 维度的 discounted 累加：A_cum[:, s] = A_step[:, s] + gamma * A_cum[:, s+1]
+            A_cum = torch.zeros_like(A_step)
+            for s in range(Smax, -1, -1):
+                if s == Smax:
+                    A_cum[:, s] = A_step[:, s]
+                else:
+                    A_cum[:, s] = A_step[:, s] + discount * A_cum[:, s + 1]
+                # 对于不存在该 step 的样本清零，防止“跨越 last_step 泄露”
+                A_cum[:, s] = A_cum[:, s] * (last_step >= s).to(dtype)
+
+            # 3) 广播回 token：同 step token 取同一个累加后的优势
+            gather_idx = sids.clamp(min=0)                         # pad(-1) clamp 到 0，后面用 valid 清掉
+            prm_adv_tokens = A_cum.gather(1, gather_idx) * valid.to(dtype)
+            prm_adv_tokens = prm_adv_tokens * response_mask.to(dtype)
+        # ================= End step cumulative =================
+
+    # ================= 汇总 =================
+    if (alpha != 0) and (beta != 0):
+        print('prm + orm')
+        advantages = (alpha * orm_adv_tokens + beta * prm_adv_tokens) * response_mask.to(dtype)
+    elif (alpha != 0) and (beta == 0):
+        print('orm only')
+        advantages = orm_adv_tokens * response_mask.to(dtype)
+    elif (alpha == 0) and (beta != 0):
+        print('prm only')
+        advantages = prm_adv_tokens * response_mask.to(dtype)
+    else:
+        raise
+
+    returns = advantages.clone()
+    return advantages, returns
+
+
+
+# @register_adv_est(AdvantageEstimator.GRPO_PRM_STEP) 
+# def compute_grpo_prm_step_advantage(
+#     token_level_rewards: torch.Tensor,   # (B, T)
+#     response_mask: torch.Tensor,         # (B, T)
+#     index: np.ndarray,                   # (B,) —— 字符串/UUID 数组
+#     step_ids: torch.Tensor,              # (B, T), 0..S-1；pad == -1
+#     alpha: float = 1.0,
+#     beta: float = 1.0,
+#     epsilon: float = 1e-6,
+#     norm_adv_by_std_in_grpo: bool = True,
+#     config: Optional["AlgoConfig"] = None,
+# ) -> Tuple[torch.Tensor, torch.Tensor]:
+#     """
+#     GRPO: ORM(最后一个 step) + PRM(其余 step)
+#     - 组内定义按字符串 index 判定：相同字符串 => 同一组
+#     - ORM：末步 step-reward 在同组内做 (x-mean)/std，广播到整条轨迹
+#     - PRM：每个非末步 step 的 step-reward 在“同组 + 同 step 序号”内做 (x-mean)/std，
+#            广播到该 step 的所有 token
+#     - 最终 advantage 为两者逐 token 相加，并乘 response_mask
+#     """
+#     print("use grpo prm step!!")
+
+#     assert token_level_rewards.shape[0] == response_mask.shape[0] == step_ids.shape[0], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+#     assert token_level_rewards.shape[1] == response_mask.shape[1]+1 == step_ids.shape[1], f"{token_level_rewards.shape},{response_mask.shape },{step_ids.shape}"
+
+#     B, T = response_mask.shape
+#     device = token_level_rewards.device
+#     dtype = token_level_rewards.dtype
+
+#     if isinstance(index, np.ndarray):
+#         idx_list = index.tolist()
+#     else:
+#         idx_list = list(index)
+#     if len(idx_list) != B:
+#         raise ValueError(f"index 长度({len(idx_list)})与 batch 大小({B})不一致。")
+
+#     group2rows: Dict[str, np.ndarray] = {}
+#     for i, k in enumerate(idx_list):
+#         group2rows.setdefault(str(k), []).append(i)
+#     for k in list(group2rows.keys()):
+#         group2rows[k] = np.asarray(group2rows[k], dtype=np.int64)
+
+#     valid_tok_mask = step_ids.ge(0)  # (B, T)
+#     last_step_per_sample = step_ids.max(dim=1).values  # (B,)
+
+#     print('alpha', alpha)
+#     print('beta', beta)
+    
+#     if alpha!=0:
+#         # ================= ORM =================
+#         mask_orm_tok = ~valid_tok_mask # & (step_ids == last_step_per_sample.unsqueeze(1))
+#         orm_reward_per_sample = (token_level_rewards * mask_orm_tok.to(dtype)).sum(dim=1)  # (B,)
+#         print('orm_reward_per_sample', orm_reward_per_sample[:2])
+#         orm_present = last_step_per_sample.ge(0)
+#         orm_adv_per_sample = groupwise_center_and_scale(orm_reward_per_sample, orm_present, group2rows=group2rows)  # (B,)
+#         print('idx_list',idx_list)
+#         print('group2rows',group2rows)
+#         # exit(0)
+#         # compute_mean('ORM', orm_adv_per_sample)
+#         #print('orm_adv_per_sample', orm_adv_per_sample.detach().tolist())
+#         orm_adv_tokens = orm_adv_per_sample.unsqueeze(1).expand(B, T)  # 广播到整条轨迹
+#         # advantages = orm_adv_tokens * response_mask.to(dtype)
+    
+#     if beta != 0:
+#         # ================= PRM =================
+#         step_ids = step_ids[:,:-1]
+#         valid_tok_mask = valid_tok_mask[:,:-1]
+#         token_level_rewards = token_level_rewards[:,:-1]
+#         assert step_ids.shape == response_mask.shape == valid_tok_mask.shape == token_level_rewards.shape
+#         # ================= PRM =================
+#         prm_adv_tokens = torch.zeros((B, T), device=device, dtype=dtype)
+#         max_step_any = int(last_step_per_sample.max().item()) if int(last_step_per_sample.max().item()) >= 0 else -1
+
+#         for s in range(max_step_any + 1):
+#             has_step_s = last_step_per_sample.ge(s)
+#             # is_last_step = last_step_per_sample.eq(s)
+#             prm_present = has_step_s #& (~is_last_step)  # 仅非末步参与 PRM
+
+#             if not bool(prm_present.any()):
+#                 continue
+
+#             mask_s_tok = valid_tok_mask & (step_ids == s)               # (B, T)
+#             if not bool(mask_s_tok.any()):
+#                 continue
+
+#             step_reward_s = (token_level_rewards * mask_s_tok.to(dtype)).sum(dim=1)  # (B,)
+#             print('step_reward_s', s, step_reward_s[:2])
+#             step_adv_per_sample = groupwise_center_and_scale(step_reward_s, prm_present, group2rows=group2rows)  # (B,)
+#             # compute_mean('PRM', step_adv_per_sample)
+#             prm_adv_tokens = prm_adv_tokens + step_adv_per_sample.unsqueeze(1) * mask_s_tok.to(dtype)
+
+#     # ================= 汇总 =================
+#     if (alpha != 0) and (beta != 0):
+#         print('prm + orm')
+#         advantages = (alpha * orm_adv_tokens + beta * prm_adv_tokens) * response_mask.to(dtype)
+#     elif (alpha != 0) and (beta == 0):
+#         print('orm only')
+#         advantages = orm_adv_tokens * response_mask.to(dtype)
+#     elif (alpha == 0) and (beta != 0):
+#         print('prm only')
+#         advantages = prm_adv_tokens * response_mask.to(dtype)
+#     else:
+#         raise
+
+#     returns = advantages.clone()
+#     return advantages, returns
+
+
+# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+@register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
+def compute_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for GRPO, operating only on Outcome reward
+    (with only one scalar reward for each response).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Note:
+        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.REINFORCE) 
+def compute_reinforce_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+):
+    print("use reinfoce orm!!")
+    scores = token_level_rewards.sum(dim=-1)
+    advantages = scores.unsqueeze(-1) * response_mask
+    returns = advantages
+    return advantages, returns
+
+
+# WARNNING: THIS CAN NOT USE!!!!!!
+@register_adv_est(AdvantageEstimator.REINFORCE_STEP)  
+def compute_reinforce_prm_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    step_ids: torch.Tensor,
+    beta: float = 1.0
+):
+    """
+    PRM advantage:
+    - step_ids 与 token_level_rewards 维度一致，step 内最后一个 token 处有该 step 的 reward，其余为 0；
+    - 对于每个 step k，优势等于从当前 step k 到最后一个有效 step 的 reward 之和；
+    - 将该和广播到该 step 内所有 token 上；
+    - step_ids == -1 或 response_mask==0 的位置为 padding，advantages 置 0。
+
+    Args:
+        token_level_rewards: (B, T) 或 (T,)
+        response_mask:       (B, T) 或 (T,)  (0/1)
+        step_ids:            (B, T) 或 (T,)  (非负为 step id，-1 为 pad)
+
+    Returns:
+        advantages, returns: 形状与输入一致；returns = advantages
+    """
+
+    print("use reinfoce prm!!")
+
+    # 统一到 (B, T) 处理
+    squeeze_back = False
+    if token_level_rewards.dim() == 1:
+        token_level_rewards = token_level_rewards.unsqueeze(0)
+        response_mask = response_mask.unsqueeze(0)
+        step_ids = step_ids.unsqueeze(0)
+        squeeze_back = True
+
+    assert token_level_rewards.shape == response_mask.shape == step_ids.shape, \
+        f"Shape mismatch: rewards {token_level_rewards.shape}, mask {response_mask.shape}, step_ids {step_ids.shape}"
+
+    B, T = token_level_rewards.shape
+    advantages = torch.zeros_like(token_level_rewards)
+
+    for b in range(B):
+        sid = step_ids[b]                              # (T,)
+        valid_tok = (sid >= 0) & (response_mask[b] > 0)
+
+        if not torch.any(valid_tok):
+            continue
+
+        # 该样本的 step 数（假设 step_ids 从 0 连续编号）
+        n_steps = int(sid[valid_tok].max().item()) + 1
+
+        # 汇总每个 step 的 reward（只有该 step 的最后一个 token 处非 0）
+        per_step_rewards = token_level_rewards[b].new_zeros(n_steps)
+        per_step_rewards.scatter_add_(0, sid[valid_tok].long(), token_level_rewards[b, valid_tok])
+
+        # 从当前 step 到最后一步的累计和：r_k + r_{k+1} + ... + r_{S-1}
+        future_cumsum = torch.flip(
+            torch.cumsum(torch.flip(per_step_rewards, dims=[0]), dim=0),
+            dims=[0]
+        )  # (n_steps,)
+
+        # 广播到各 token（仅对有效 token）
+        adv_b = torch.zeros(T, dtype=token_level_rewards.dtype, device=token_level_rewards.device)
+        adv_b[valid_tok] = future_cumsum[sid[valid_tok].long()]
+        advantages[b] = adv_b
+
+    # 掩码掉 padding
+    advantages = advantages * response_mask
+    returns = advantages
+
+    if squeeze_back:
+        advantages = advantages.squeeze(0)
+        returns = returns.squeeze(0)
+
+    return advantages, returns
+
+
+
+@register_adv_est(AdvantageEstimator.GRPO_PASSK)  # or simply: @register_adv_est("grpo_passk")
+def compute_grpo_passk_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for Pass@k using a GRPO-style outcome reward formulation.
+    Only the best response per group gets a non-zero advantage: r_max - r_second_max.
+
+    Implemented as described in https://arxiv.org/abs/2503.19595.
+
+    Args:
+        token_level_rewards: (bs, response_length)
+        response_mask: (bs, response_length)
+        index: (bs,) → group ID per sample
+        epsilon: float for numerical stability
+        config: (AlgoConfig) algorithm settings, which contains "norm_adv_by_std_in_grpo"
+
+    Returns:
+        advantages: (bs, response_length)
+        returns: (bs, response_length)
+    """
+    assert config is not None
+    # if True, normalize advantage by std within group
+    norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", True)
+    scores = token_level_rewards.sum(dim=-1)  # (bs,)
+    advantages = torch.zeros_like(scores)
+
+    id2scores = defaultdict(list)
+    id2indices = defaultdict(list)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            idx = index[i]
+            id2scores[idx].append(scores[i])
+            id2indices[idx].append(i)
+
+        for idx in id2scores:
+            rewards = torch.stack(id2scores[idx])  # (k,)
+            if rewards.numel() < 2:
+                raise ValueError(
+                    f"Pass@k requires at least 2 samples per group. Got {rewards.numel()} for group {idx}."
+                )
+            topk, topk_idx = torch.topk(rewards, 2)
+            r_max, r_second_max = topk[0], topk[1]
+            i_max = id2indices[idx][topk_idx[0].item()]
+            advantage = r_max - r_second_max
+            if norm_adv_by_std_in_grpo:
+                std = torch.std(rewards)
+                advantage = advantage / (std + epsilon)
+            advantages[i_max] = advantage
+
+    advantages = advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages
+
+
+@register_adv_est(
+    AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE
+)  # or simply: @register_adv_est("reinforce_plus_plus_baseline")
+def compute_reinforce_plus_plus_baseline_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: torch.Tensor,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for RF++-baseline (https://arxiv.org/abs/2501.03262), operating only on Outcome reward
+    (with only one scalar reward for each response).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        config: (AlgoConfig) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            scores[i] = scores[i] - id2mean[index[i]]
+
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * response_mask
+        scores = verl_F.masked_whiten(scores, response_mask) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.RLOO)  # or simply: @register_adv_est("rloo")
+def compute_rloo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        config: (AlgoConfig) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            response_num = len(id2score[index[i]])
+            if response_num > 1:
+                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[index[i]] * response_num / (
+                    response_num - 1
+                )
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
+def compute_opo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for OPO based on https://arxiv.org/pdf/2505.23585
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        config: (AlgoConfig) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = response_mask.sum(dim=-1)
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2len = defaultdict(list)
+    id2bsl = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+            id2len[index[i]].append(response_length[i])
+
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2bsl[idx] = torch.tensor(0.0)
+            elif len(id2score[idx]) > 1:
+                score_tensor = torch.tensor(id2score[idx])
+                len_tensor = torch.tensor(id2len[idx])
+                id2bsl[idx] = (len_tensor * score_tensor).sum() / len_tensor.sum()
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            scores[i] = scores[i] - id2bsl[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.REINFORCE_PLUS_PLUS)  # or simply: @register_adv_est("reinforce_plus_plus")
+def compute_reinforce_plus_plus_outcome_advantage(
+    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, config: Optional[AlgoConfig] = None, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for REINFORCE++.
+    This implementation is based on the paper: https://arxiv.org/abs/2501.03262
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        config: (AlgoConfig) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    assert config is not None
+    gamma = config.gamma
+    with torch.no_grad():
+        returns = torch.zeros_like(token_level_rewards)
+        running_return = 0
+
+        for t in reversed(range(token_level_rewards.shape[1])):
+            running_return = token_level_rewards[:, t] + gamma * running_return
+            returns[:, t] = running_return
+            # Reset after EOS
+            running_return = running_return * response_mask[:, t]
+
+        advantages = verl_F.masked_whiten(returns, response_mask)
+        advantages = advantages * response_mask
+
+    return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.REMAX)  # or simply: @register_adv_est("remax")
+def compute_remax_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    reward_baselines: torch.Tensor,
+    response_mask: torch.Tensor,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for ReMax, operating only on Outcome reward
+    This implementation is based on the paper: https://arxiv.org/abs/2310.10505
+    (with only one scalar reward for each response).
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        reward_baselines: `(torch.Tensor)`
+            shape: (bs,)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        config: (AlgoConfig) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+
+    with torch.no_grad():
+        returns = (token_level_rewards * response_mask).flip(dims=[-1]).cumsum(dim=-1).flip(dims=[-1])
+        advantages = returns - reward_baselines.unsqueeze(-1) * response_mask
+
+    return advantages, returns
+
+
+@register_adv_est(AdvantageEstimator.GPG)  # or simply: @register_adv_est("gpg")
+def compute_gpg_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    f_norm: float = 1.0,
+    alpha: float = 1.0,
+    config=None,
+    **kwargs,
+):
+    """
+    Compute advantage for GPG, operating only on Outcome reward
+    (with only one scalar reward for each response).
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        index: `(np.ndarray)`
+            shape: (bs,)
+        epsilon: (float)
+        f_norm: (float)
+        alpha: (float)
+        config: (dict) algorithm config
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        m = torch.count_nonzero(scores)
+        alpha = bsz / m.clamp(min=1)
+
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            scores[i] = alpha * (scores[i] - id2mean[index[i]]) / (f_norm)
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
+    """Compute token-level rewards with KL penalty.
+
+    Args:
+        token_level_scores (torch.Tensor): Token-level reward scores.
+        old_log_prob (torch.Tensor): Log probabilities from current policy.
+        ref_log_prob (torch.Tensor): Log probabilities from reference policy.
+        kl_ratio (float): KL penalty coefficient.
+
+    Returns:
+        torch.Tensor: Token-level rewards with KL penalty applied.
+    """
+    kl = old_log_prob - ref_log_prob
+    return token_level_scores - kl * kl_ratio
+
+
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
+    """
+    Aggregate the loss matrix into a scalar.
+
+    Args:
+        loss_mat: `(torch.Tensor)`:
+            shape: (bs, response_length)
+        loss_mask: `(torch.Tensor)`:
+            shape: (bs, response_length)
+        loss_agg_mode: (str) choices:
+            method to aggregate the loss matrix into a scalar.
+    Returns:
+        loss: `a scalar torch.Tensor`
+            aggregated loss
+    """
+    if loss_agg_mode == "token-mean":
+        loss = verl_F.masked_mean(loss_mat, loss_mask)
+    elif loss_agg_mode == "seq-mean-token-sum":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
+        loss = torch.mean(seq_losses)  # seq-mean
+    elif loss_agg_mode == "seq-mean-token-mean":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
+        loss = torch.mean(seq_losses)  # seq-mean
+    elif loss_agg_mode == "seq-mean-token-sum-norm":
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        loss = torch.sum(seq_losses) / loss_mask.shape[-1]  # The divisor
+        # (loss_mask.shape[-1]) should ideally be constant
+        # throughout training to well-replicate the DrGRPO paper.
+        # TODO: Perhaps add user-defined normalizer argument to
+        # agg_loss to ensure divisor stays constant throughout.
+    else:
+        raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+    return loss
+
+
+def compute_policy_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute the clipped policy objective and related metrics for PPO.
+
+    Adapted from
+    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        cliprange (float, optional):
+            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+            Defaults to None (must be provided).
+        cliprange_low (float, optional):
+            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        cliprange_high (float, optional):
+            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        clip_ratio_c (float, optional):
+            Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+            Defaults to 3.0.
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+    """
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(
+        ratio, 1 - cliprange_low, 1 + cliprange_high
+    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(
+        pg_losses1, pg_losses2
+    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+    )
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss("gpg")
+def compute_policy_loss_gpg(old_log_prob, log_prob, advantages, response_mask, loss_agg_mode="token-mean", config=None):
+    """Adapted from
+    https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
+    Args:
+        log_prob: `(torch.Tensor)`
+            shape: (bs, response_length)
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    return:
+        pg_loss: `a scalar torch.Tensor`
+            policy gradient loss computed via GPG
+    """
+    pg_losses = -log_prob * advantages
+
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
+
+
+@register_policy_loss("clip_cov")
+def compute_policy_loss_clip_cov(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective and related metrics for Clip-Cov.
+
+    Adapted from
+    https://github.com/PRIME-RL/Entropy-Mechanism-of-RL/blob/main/verl/trainer/ppo/core_algos.py
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        cliprange (float, optional):
+            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+            Defaults to None (must be provided).
+        cliprange_low (float, optional):
+            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        cliprange_high (float, optional):
+            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        clip_cvo_ratio (float, optional):
+            Ratio for clipping the covariance. Defaults to 0.0002.
+        clip_cov_lb (float, optional):
+            Lower bound for clipping covariance. Defaults to 1.0.
+        clip_cov_ub (float, optional):
+            Upper bound for clipping covariance. Defaults to 5.0.
+    """
+    clip_cov_ratio = config.policy_loss.clip_cov_ratio if config.policy_loss.clip_cov_ratio is not None else 0.0002
+    cliprange = config.clip_ratio
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+    clip_cov_ub = config.policy_loss.clip_cov_ub if config.policy_loss.clip_cov_ub is not None else 5.0
+    clip_cov_lb = config.policy_loss.clip_cov_lb if config.policy_loss.clip_cov_lb is not None else 1.0
+
+    assert clip_cov_ratio > 0, "clip_ratio should be larger than 0."
+
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_losses1 = -advantages * ratio
+
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    corr = torch.ones_like(advantages)
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    clip_by_origin = (pg_losses2 > pg_losses1) & (response_mask > 0)
+
+    cov_all = (advantages - verl_F.masked_mean(advantages, response_mask)) * (
+        log_prob - verl_F.masked_mean(log_prob.detach(), response_mask)
+    )
+    cov_all[response_mask == 0] = -torch.inf
+    cov_all[clip_by_origin] = -torch.inf
+
+    clip_num = max(int(clip_cov_ratio * response_mask.sum().item()), 1)
+    top_k_idx = (cov_all < clip_cov_ub) & (cov_all > clip_cov_lb) & (response_mask > 0)
+    top_k_idx = torch.nonzero(top_k_idx)
+
+    if len(top_k_idx) > 0:
+        perm = torch.randperm(len(top_k_idx))
+        top_k_idx = top_k_idx[perm[: min(clip_num, len(top_k_idx))]]
+    else:
+        top_k_idx = torch.empty((0, 2), device=cov_all.device, dtype=torch.long)
+
+    corr[top_k_idx[:, 0], top_k_idx[:, 1]] = 0
+
+    pg_clipfrac = verl_F.masked_mean((corr == 0).float(), response_mask)
+
+    pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, pg_clipfrac, ppo_kl, torch.tensor(0.0)
+
+
+@register_policy_loss("kl_cov")
+def compute_policy_loss_kl_cov(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective and related metrics for Clip-Cov.
+
+    Adapted from
+    https://github.com/PRIME-RL/Entropy-Mechanism-of-RL/blob/main/verl/trainer/ppo/core_algos.py
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        kl_cov_ratio (float, optional):
+            Ratio for selecting the top-k covariance values. Defaults to 0.0002.
+        ppo_kl_coef (float, optional):
+            Coefficient for the KL penalty term in the loss. Defaults to 1.
+    """
+    kl_cov_ratio = config.policy_loss.kl_cov_ratio if config.policy_loss.kl_cov_ratio is not None else 0.0002
+    ppo_kl_coef = config.policy_loss.ppo_kl_coef if config.policy_loss.ppo_kl_coef is not None else 1.0
+
+    assert kl_cov_ratio > 0, "kl_cov_ratio should be larger than 0."
+
+    negative_approx_kl = log_prob - old_log_prob
+    abs_kl = negative_approx_kl.abs()
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl_abs = verl_F.masked_mean(negative_approx_kl.abs(), response_mask)
+    pg_losses1 = -advantages * ratio
+    pg_losses_kl = -advantages * ratio + ppo_kl_coef * abs_kl
+    pg_losses = pg_losses1
+
+    all_valid = response_mask > 0
+    all_valid_idx = torch.nonzero(all_valid.reshape(-1), as_tuple=True)[0]
+    all_valid_adv = advantages[all_valid].detach().reshape(-1).cpu()
+    all_valid_logp = log_prob[all_valid].detach().reshape(-1).cpu()
+
+    k = min(kl_cov_ratio, len(all_valid_adv))
+
+    if k != 0:
+        cov_lst_all = (all_valid_adv - all_valid_adv.mean()) * (all_valid_logp - all_valid_logp.mean())
+        k_percent_nums = max(1, int(len(cov_lst_all) * kl_cov_ratio))
+        large_cov_idxs = torch.topk(cov_lst_all, k_percent_nums, largest=True).indices
+
+        if len(large_cov_idxs) != 0:
+            large_cov_idxs = all_valid_idx[large_cov_idxs]
+            pg_losses[large_cov_idxs // advantages.shape[1], large_cov_idxs % advantages.shape[1]] = pg_losses_kl[
+                large_cov_idxs // advantages.shape[1], large_cov_idxs % advantages.shape[1]
+            ]
+
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return pg_loss, torch.tensor(0.0), ppo_kl_abs, torch.tensor(0.0)
+
+
+def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
+    """Compute categorical entropy loss (For backward compatibility)
+
+    Args:
+        logits (torch.Tensor): shape is (bs, response_length, vocab_size)
+        response_mask (torch.Tensor): shape is (bs, response_length)
+
+    Returns:
+        entropy: a scalar torch.Tensor
+
+    """
+    # compute entropy
+    token_entropy = verl_F.entropy_from_logits(logits)  # (bs, response_len)
+    entropy_loss = agg_loss(loss_mat=token_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    return entropy_loss
+
+
+def compute_value_loss(
+    vpreds: torch.Tensor,
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    cliprange_value: float,
+    loss_agg_mode: str = "token-mean",
+):
+    """
+    Compute the clipped value-function loss for PPO.
+
+    Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1151
+
+    Args:
+        vpreds (torch.FloatTensor):
+            Predicted values from the value head, shape (batch_size, response_length).
+        values (torch.FloatTensor):
+            Old (baseline) values from the value head, shape (batch_size, response_length).
+        returns (torch.FloatTensor):
+            Ground-truth returns, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the value loss calculation.
+        cliprange_value (float):
+            Clip range for value prediction updates.
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+
+    Returns:
+        vf_loss (torch.FloatTensor):
+            A scalar tensor containing the aggregated value-function loss.
+        vf_clipfrac (float):
+            Fraction of elements where the clipped loss was used.
+    """
+    vpredclipped = verl_F.clip_by_value(vpreds, values - cliprange_value, values + cliprange_value)
+    vf_losses1 = (vpreds - returns) ** 2
+    vf_losses2 = (vpredclipped - returns) ** 2
+    clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+    return vf_loss, vf_clipfrac
+
+
+def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+    """Compute KL divergence given logprob and ref_logprob.
+    Copied from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1104
+    See more description in http://joschu.net/blog/kl-approx.html
+
+    Args:
+        logprob:
+        ref_logprob:
+
+    Returns:
+
+    """
+    if kl_penalty in ("kl", "k1"):
+        return logprob - ref_logprob
+
+    if kl_penalty == "abs":
+        return (logprob - ref_logprob).abs()
+
+    if kl_penalty in ("mse", "k2"):
+        return 0.5 * (logprob - ref_logprob).square()
+
+    # J. Schulman. Approximating kl divergence, 2020.
+    # # URL http://joschu.net/blog/kl-approx.html.
+    if kl_penalty in ("low_var_kl", "k3"):
+        kl = ref_logprob - logprob
+        # For numerical stability
+        kl = torch.clamp(kl, min=-20, max=20)
+        ratio = torch.exp(kl)
+        kld = (ratio - kl - 1).contiguous()
+        return torch.clamp(kld, min=-10, max=10)
+
+    if kl_penalty == "full":
+        # so, here logprob and ref_logprob should contain the logits for every token in vocabulary
+        raise NotImplementedError
+
+    raise NotImplementedError
+
+
+def compute_pf_ppo_reweight_data(
+    data,
+    reweight_method: str = "pow",
+    weight_pow: float = 2.0,
+):
+    """Reweight the data based on the token_level_scores.
+
+    Args:
+        data: DataProto object, containing batch, non_tensor_batch and meta_info
+        reweight_method: str, choices: "pow", "max_min", "max_random"
+        weight_pow: float, the power of the weight
+
+    Returns:
+
+    """
+
+    @torch.no_grad()
+    def compute_weights(scores: torch.Tensor, reweight_method: str, weight_pow: float) -> torch.Tensor:
+        """Compute importance weights for resampling based on scores.
+
+        Args:
+            scores (torch.Tensor): Tensor of scores to compute weights from.
+            reweight_method (str): Method for computing weights ('pow', 'max_min', 'max_random').
+            weight_pow (float): Power exponent for 'pow' method.
+
+        Returns:
+            torch.Tensor: Computed importance weights.
+
+        Raises:
+            ValueError: If reweight_method is not supported.
+        """
+        if reweight_method == "pow":
+            weights = torch.pow(torch.abs(scores), weight_pow)
+        elif reweight_method == "max_min":
+            max_score = torch.max(scores)
+            min_score = torch.min(scores)
+            weights = torch.where((scores == max_score) | (scores == min_score), 1.0, 0.0)
+        elif reweight_method == "max_random":
+            max_score = torch.max(scores)
+            weights = torch.where(scores == max_score, 0.4, 0.1)
+        else:
+            raise ValueError(f"Unsupported reweight_method: {reweight_method}")
+        return weights
+
+    scores = data.batch["token_level_scores"].sum(dim=-1)
+    weights = compute_weights(scores, reweight_method, weight_pow)
+    weights = torch.clamp(weights + 1e-8, min=1e-8)
+
+    batch_size = scores.shape[0]
+    sample_indices = torch.multinomial(weights, batch_size, replacement=True)
+
+    resampled_batch = {key: tensor[sample_indices] for key, tensor in data.batch.items()}
+
+    sample_indices_np = sample_indices.numpy()
+    resampled_non_tensor_batch = {}
+    for key, array in data.non_tensor_batch.items():
+        if isinstance(array, np.ndarray):
+            resampled_non_tensor_batch[key] = array[sample_indices_np]
+        else:
+            resampled_non_tensor_batch[key] = [array[i] for i in sample_indices_np]
+
+    resampled_meta_info = {}
+    for key, value in data.meta_info.items():
+        if isinstance(value, list) and len(value) == batch_size:
+            resampled_meta_info[key] = [value[i] for i in sample_indices_np]
+        else:
+            resampled_meta_info[key] = value
+
+    from copy import deepcopy
+
+    resampled_data = deepcopy(data)
+    resampled_data.batch = type(data.batch)(resampled_batch)
+    resampled_data.batch.batch_size = data.batch.batch_size
+    resampled_data.non_tensor_batch = resampled_non_tensor_batch
+    resampled_data.meta_info = resampled_meta_info
+
+    return resampled_data
