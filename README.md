@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <b>Teng Xiao, Yige Yuan, Hamish Ivison, Faeze Brahman, Huaisheng Zhu, Nathan Lambert, Pradeep Dasigi, Noah A. Smith, Hannaneh Hajishirzi</b>
+  <b>Teng Xiao, Yige Yuan, Hamish Ivison, Faeze Brahman, Huaisheng Zhu, Nathan Lambert,</b><br>
+  <b>Pradeep Dasigi, Noah A. Smith, Hannaneh Hajishirzi</b>
 </p>
 
 ## Introduction
