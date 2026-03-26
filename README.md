@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  🧠 In-Context Meta-Reinforcement Learning &nbsp;|&nbsp; 🪞 Self-Reflection &nbsp;|&nbsp; 🔁 Learning How to search at Test Time
+  🧠 In-Context Meta-Reinforcement Learning &nbsp;|&nbsp; 🪞 Self-Reflection &nbsp;|&nbsp; 🔁 Learning How to Search at Test Time
 </p>
 
 <p align="center">
