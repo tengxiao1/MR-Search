@@ -8,6 +8,10 @@
   🧠 In-Context Meta-Reinforcement Learning &nbsp;|&nbsp; 🪞 Self-Reflection &nbsp;|&nbsp; 🔁 Learning How to search at Test Time
 </p>
 
+<p align="center">
+  <b>Teng Xiao, Yige Yuan, Hamish Ivison, Faeze Brahman, Huaisheng Zhu, Nathan Lambert, Pradeep Dasigi, Noah A. Smith, Hannaneh Hajishirzi</b>
+</p>
+
 ## Introduction
 
 Existing RL-based agentic search methods optimize within a single episode, treating each attempt in isolation. We introduce **MR-Search**, a **Meta-Reinforcement Learning** framework that trains agents to improve **across episodes** via explicit self-reflection. As shown below, MR-Search organizes training into *meta-episodes* of multiple *inner-episodes*. After each failed attempt, the agent generates **Self-Reflection** that is prepended to the next episode, enabling progressive strategy refinement. We train this policy with a **multi-turn RL algorithm** featuring fine-grained credit assignment across the full multi-episode trajectory, achieving **9.2%–19.3% improvements** over strong baselines on  agentic search benchmarks. 
